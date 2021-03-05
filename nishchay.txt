@@ -1,0 +1,181 @@
+ 'MessagesDBService: Loading Latest Messages took: '
+      '${DateTime.now().difference(dt).inMicroseconds}μs',
+      name: 'MessageDBService',
+    );
+    developer.log('init.completed', name: 'MessageDBService');
+
+    this.scrollController.addListener(onScroll);
+
+    developer.log('Added `onScroll` Listener', name: 'MessageDBService');
+    developer.log(
+      'MessagesDBService: Latest Message Time '
+      '${cacheEnd?.toLocal()?.toIso8601String()}',
+      name: 'MessageDBService',
+    );
+
+    Stream<QuerySnapshot> dataStream;
+    // Get New Documents
+    if (cacheEnd == null) {
+      dataStream = chatRoomReference
+          .collection('messages')
+          .where('timeStamp', isGreaterThanOrEqualTo: joinedTimestamp)
+          .orderBy('timeStamp')
+          .limitToLast(50)
+          .snapshots();
+    } else {
+      dataStream = chatRoomReference
+          .collection('messages')
+          .where('timeStamp', isGreaterThanOrEqualTo: joinedTimestamp)
+          .where('timeStamp', isGreaterThan: Timestamp.fromDate(cacheEnd))
+          .orderBy('timeStamp')
+          .snapshots();
+    }
+    dataSubscription = dataStream.listen(onFirestoreDocumentChanges, onDone: () {
+      _controller.sink.close();
+    });
+    developer.log('Added `onFirestoreDocumentChanges` Listener',
+        name: 'MessageDBService');
+    // Listen to Newer Documents.
+  }
+
+  onFirestoreDocumentChanges(QuerySnapshot snapshot) async {
+    developer.log('onFirestoreDocumentChanges', name: 'MessageDBService');
+    developer.log('# Streaming Docs:' + snapshot.docs.length.toString(),
+        name: 'MessageDBService');
+
+    for (var doc in snapshot.docs) {
+      List<Message> newMessages = [];
+
+      if (snapshot.docs.length >= 50) {
+        // Use a new stream and save current messages.
+      }
+      try {
+        /// Why [DocumentChangeType.modified]? Because of [FieldValue.serverTimestamp()]
+        if (doc.data()['timeStamp'] != null && !messageIds.contains(doc.reference.id)) {
+          var messageData = encrypt.decrypt(doc.data(), doc.id);
+          var profileDoc =
+              await (_db.collection('profiles').doc(doc.get('author'))).getCached();
+          // Do await step here since Messages are immutable.
+          // Doing await anywhere else will lead to performance drawbacks.
+          if (messageData['mediaType'] == 'POST') {
+            // var postDoc = await (_db.collection('posts').doc(messageData['mediaId']).getCached());
+            // Do some async computation if required
+          }
+          var message = Message.fromMap(
+            messageData: messageData,
+            reference: doc.reference,
+            chatroom: chatRoomReference.id,
+            authorProfileMap: profileDoc.data(),
+          );
+          newMessages.add(message);
+          messageIds.add(message.reference.id);
+        }
+      } catch (e) {
+        print("Error Occurred ${e.toString()}");
+        continue;
+      }
+      for (var m in newMessages) {
+        messages.addFirst(m);
+        saveToDB = saveToDB.then((_) async {
+          await MessageDatabase.instance.insertMessage(m);
+          developer.log('Saving Message ${m.messageId} to database.',
+              name: 'MessageDBService');
+        }).catchError((e) {
+          // Should block the chain hence keeping DB in sync.
+          developer.log('Unable to save document. Error ${e.toString()}',
+              name: 'MessageDBService');
+        });
+      }
+      _controller.sink.add(messages);
+      // ...
+    }
+  }
+
+  onScroll() {
+    if (scrollController.offset >=
+            max(scrollController.position.maxScrollExtent * 0.9,
+                scrollController.position.maxScrollExtent - 64.0) &&
+        !scrollController.position.outOfRange) {
+      developer.log('Reached the end of loaded data. Asking for more',
+          name: 'MessageDBService');
+      // Done: Fetch older messages from the database.
+      if (!isDbExhausted && !isDbBusy) {
+        retrieveMoreMessages();
+      } else if (isDbExhausted && !isFirestoreBusy && !isFireStoreExhausted) {
+        loadFirebaseMessages();
+      } else {
+        developer.log('No more data.', name: 'MessageDBService');
+      }
+    }
+  }
+
+  Future<void> loadFirebaseMessages({int amount = 20}) async {
+    developer.log('Querying Firebase for more Data', name: 'MessageDBService');
+    isFirestoreBusy = true;
+    var dt = DateTime.now();
+    // Query Database
+    var snap = await chatRoomReference
+        .collection('messages')
+        .where('timeStamp', isGreaterThanOrEqualTo: joinedTimestamp)
+        .where('timeStamp',
+            isLessThan: Timestamp.fromDate(firebaseStart ?? DateTime.now()))
+        .orderBy('timeStamp', descending: true)
+        .limit(amount)
+        .get();
+    if (snap.docs.isEmpty) {
+      developer.log('No more data in the Database', name: 'MessageDBService');
+      isFirestoreBusy = false;
+      isFireStoreExhausted = true;
+      return;
+    }
+
+    List<Message> olderMessages = [];
+    for (var doc in snap.docs) {
+      olderMessages.add(Message.fromMap(
+        messageData: encrypt.decrypt(doc.data(), doc.id),
+        reference: doc.reference,
+        chatroom: chatRoomReference.id,
+        authorProfile: await getCachedProfile(doc.get('author')),
+      ));
+    }
+
+    messages.addAll(olderMessages);
+    // If query returns null, query Firestore
+    firebaseStart = olderMessages.last.timeStamp.toDate();
+    if (_controller.isClosed) return;
+
+    _controller.sink.add(messages);
+    developer.log('Adding more Data to stream', name: 'MessageDBService');
+    developer.log(
+      'Retrieving took: ${DateTime.now().difference(dt).inMicroseconds}μs',
+      name: 'MessageDBService',
+    );
+    isFirestoreBusy = false; // Acts as a lock
+  }
+
+  Future<void> retrieveMoreMessages({int amount = 20}) async {
+    developer.log('Querying Local Database for more Data', name: 'MessageDBService');
+    isDbBusy = true;
+    var dt = DateTime.now();
+    // Query Database
+    var olderMessages = await MessageDatabase.instance.query(
+      chatRoom: chatRoomReference.id,
+      beforeTime: messages.last.timeStamp.toDate(),
+      limit: amount,
+    );
+    if (olderMessages.isEmpty) {
+      developer.log('No more data in the Database', name: 'MessageDBService');
+      isDbBusy = false;
+      isDbExhausted = true;
+      firebaseStart = cacheStart;
+      return;
+    }
+
+    /// Cached query for getting names
+    /// Consider using a HashMap to cache [Profile] Object Manually
+    /// (Will Dramatically Improve Performance in P2P Chats)
+    for (var m in olderMessages) {
+      m.authorProfile = await getCachedProfile(m.authorId);
+    }
+
+    messages.addAll(olderMessages);
